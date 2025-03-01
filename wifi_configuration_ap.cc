@@ -80,24 +80,6 @@ void WifiConfigurationAp::Start()
     StartAccessPoint();
     StartWebServer();
     
-    // Start scan immediately
-    esp_wifi_scan_start(nullptr, false);
-    // Setup periodic WiFi scan timer
-    esp_timer_create_args_t timer_args = {
-        .callback = [](void* arg) {
-            auto* self = static_cast<WifiConfigurationAp*>(arg);
-            if (!self->is_connecting_) {
-                esp_wifi_scan_start(nullptr, false);
-            }
-        },
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "wifi_scan_timer",
-        .skip_unhandled_events = true
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &scan_timer_));
-    // Start scanning every 10 seconds
-    ESP_ERROR_CHECK(esp_timer_start_periodic(scan_timer_, 10000000));
 }
 
 std::string WifiConfigurationAp::GetSsid()
@@ -552,6 +534,12 @@ void WifiConfigurationAp::SmartConfigEventHandler(void *arg, esp_event_base_t ev
             break;
         case SC_EVENT_FOUND_CHANNEL:
             ESP_LOGI(TAG, "Found SmartConfig channel");
+            // 停止定时器
+            if (self->scan_timer_) {
+                esp_timer_stop(self->scan_timer_);
+                esp_timer_delete(self->scan_timer_);
+                self->scan_timer_ = nullptr;
+            }
             break;
         case SC_EVENT_GOT_SSID_PSWD:{
             ESP_LOGI(TAG, "Got SmartConfig credentials");
