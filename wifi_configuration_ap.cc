@@ -14,6 +14,7 @@
 #include <nvs_flash.h>
 #include <cJSON.h>
 #include <esp_smartconfig.h>
+#include <smartconfig_ack.h>
 #include "ssid_manager.h"
 
 #define TAG "WifiConfigurationAp"
@@ -23,6 +24,13 @@
 
 extern const char index_html_start[] asm("_binary_wifi_configuration_html_start");
 extern const char done_html_start[] asm("_binary_wifi_configuration_done_html_start");
+
+typedef struct {
+    char *ssid;
+    char *password;
+	smartconfig_type_t type;
+	uint8_t token;
+} WifiCredentials;
 
 WifiConfigurationAp& WifiConfigurationAp::GetInstance() {
     static WifiConfigurationAp instance;
@@ -509,13 +517,11 @@ void WifiConfigurationAp::IpEventHandler(void* arg, esp_event_base_t event_base,
 void WifiConfigurationAp::StartSmartConfig()
 {
     // 注册SmartConfig事件处理器
+    ESP_ERROR_CHECK(esp_smartconfig_set_type(SC_TYPE_AIRKISS));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(SC_EVENT, ESP_EVENT_ANY_ID,
                                                         &WifiConfigurationAp::SmartConfigEventHandler, this, &sc_event_instance_));
-
     // 初始化SmartConfig配置
     smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
-    // cfg.esp_touch_v2_enable_crypt = true;
-    // cfg.esp_touch_v2_key = "1234567890123456"; // 设置16字节加密密钥
 
     // 启动SmartConfig服务
     ESP_ERROR_CHECK(esp_smartconfig_start(&cfg));
@@ -546,18 +552,47 @@ void WifiConfigurationAp::SmartConfigEventHandler(void *arg, esp_event_base_t ev
             smartconfig_event_got_ssid_pswd_t *evt = (smartconfig_event_got_ssid_pswd_t *)event_data;
 
             char ssid[32], password[64];
+			uint8_t cellphone_ip[4];
             memcpy(ssid, evt->ssid, sizeof(evt->ssid));
             memcpy(password, evt->password, sizeof(evt->password));
+			memcpy(cellphone_ip, evt->cellphone_ip, sizeof(evt->cellphone_ip));
             ESP_LOGI(TAG, "SmartConfig SSID: %s, Password: %s", ssid, password);
-            // 尝试连接WiFi会失败，故不连接
-            self->Save(ssid, password);
-            xTaskCreate([](void *ctx){
-                ESP_LOGI(TAG, "Restarting in 3 second");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                esp_restart();
-            }, "restart_task", 4096, NULL, 5, NULL);
-            break;
-        }
+			ESP_LOGI(TAG, "Phone ip: %d.%d.%d.%d", cellphone_ip[0], cellphone_ip[1], cellphone_ip[2], cellphone_ip[3]);
+            
+            WifiCredentials *creds = (WifiCredentials *)malloc(sizeof(WifiCredentials));
+            creds->ssid = (char *)malloc(strlen(ssid) + 1);
+            creds->password = (char *)malloc(strlen(password) + 1);
+            strcpy(creds->ssid, ssid);
+            strcpy(creds->password, password);          
+            creds->type = evt->type; 
+            creds->token = evt->token;
+
+			xTaskCreate([](void *ctx){
+                WifiCredentials *creds = (WifiCredentials *)ctx;
+                ESP_LOGI(TAG, "SSID: %s", creds->ssid);
+                ESP_LOGI(TAG, "Password: %s", creds->password);
+                ESP_LOGI(TAG, "Type: %d", creds->type);
+                ESP_LOGI(TAG, "Token: %d", creds->token);
+
+				WifiConfigurationAp& this_ = WifiConfigurationAp::GetInstance();
+
+				if (this_.ConnectToWifi(creds->ssid, creds->password)) {
+					this_.Save(creds->ssid, creds->password);
+			        uint8_t cellphone_ip[4];
+                    for (int i = 0; i < 4; i++) {
+                        cellphone_ip[i] = 255;
+                    }
+                    auto ret = sc_send_ack_start(creds->type, creds->token, cellphone_ip);
+                    if (ret != ESP_OK) {
+						ESP_LOGE(TAG, "Send smartconfig ACK error: %d", ret);
+                    }
+				}
+				ESP_LOGI(TAG, "Restarting in 3 second");
+				vTaskDelay(pdMS_TO_TICKS(3000));
+				esp_restart();
+			}, "restart_task", 4096, creds, 5, NULL);
+			break;
+       }
         case SC_EVENT_SEND_ACK_DONE:
             ESP_LOGI(TAG, "SmartConfig ACK sent");
             esp_smartconfig_stop();
