@@ -24,6 +24,13 @@
 extern const char index_html_start[] asm("_binary_wifi_configuration_html_start");
 extern const char done_html_start[] asm("_binary_wifi_configuration_done_html_start");
 
+typedef struct {
+    char *ssid;
+    char *password;
+	smartconfig_type_t type;
+	uint8_t token;
+} WifiCredentials;
+
 WifiConfigurationAp& WifiConfigurationAp::GetInstance() {
     static WifiConfigurationAp instance;
     return instance;
@@ -80,22 +87,22 @@ void WifiConfigurationAp::Start()
     StartAccessPoint();
     StartWebServer();
     
-    // Start scan immediately
-    esp_wifi_scan_start(nullptr, false);
-    // Setup periodic WiFi scan timer
-    esp_timer_create_args_t timer_args = {
-        .callback = [](void* arg) {
-            auto* self = static_cast<WifiConfigurationAp*>(arg);
-            if (!self->is_connecting_) {
-                esp_wifi_scan_start(nullptr, false);
-            }
-        },
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "wifi_scan_timer",
-        .skip_unhandled_events = true
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &scan_timer_));
+    // // Start scan immediately
+    // esp_wifi_scan_start(nullptr, false);
+    // // Setup periodic WiFi scan timer
+    // esp_timer_create_args_t timer_args = {
+    //     .callback = [](void* arg) {
+    //         auto* self = static_cast<WifiConfigurationAp*>(arg);
+    //         if (!self->is_connecting_) {
+    //             esp_wifi_scan_start(nullptr, false);
+    //         }
+    //     },
+    //     .arg = this,
+    //     .dispatch_method = ESP_TIMER_TASK,
+    //     .name = "wifi_scan_timer",
+    //     .skip_unhandled_events = true
+    // };
+    // ESP_ERROR_CHECK(esp_timer_create(&timer_args, &scan_timer_));
 }
 
 std::string WifiConfigurationAp::GetSsid()
@@ -291,6 +298,21 @@ void WifiConfigurationAp::StartWebServer()
         .uri = "/scan",
         .method = HTTP_GET,
         .handler = [](httpd_req_t *req) -> esp_err_t {
+            uint16_t ap_num = 0;
+            esp_wifi_scan_get_ap_num(&ap_num);
+
+            if (ap_num == 0) {
+                ESP_LOGI(TAG, "No APs found, scanning...");
+                esp_wifi_scan_start(nullptr, true);
+                esp_wifi_scan_get_ap_num(&ap_num);
+            }
+
+            auto ap_records = std::make_unique<wifi_ap_record_t[]>(ap_num);
+            if (!ap_records) {
+                return ESP_FAIL;
+            }
+            esp_wifi_scan_get_ap_records(&ap_num, ap_records.get());
+
             auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
             std::lock_guard<std::mutex> lock(this_->mutex_);
 
@@ -740,23 +762,50 @@ void WifiConfigurationAp::SmartConfigEventHandler(void *arg, esp_event_base_t ev
             break;
         case SC_EVENT_FOUND_CHANNEL:
             ESP_LOGI(TAG, "Found SmartConfig channel");
+            // 停止定时器
+            if (self->scan_timer_) {
+                esp_timer_stop(self->scan_timer_);
+                esp_timer_delete(self->scan_timer_);
+                self->scan_timer_ = nullptr;
+            }            
             break;
         case SC_EVENT_GOT_SSID_PSWD:{
             ESP_LOGI(TAG, "Got SmartConfig credentials");
             smartconfig_event_got_ssid_pswd_t *evt = (smartconfig_event_got_ssid_pswd_t *)event_data;
 
             char ssid[32], password[64];
+			uint8_t cellphone_ip[4];
             memcpy(ssid, evt->ssid, sizeof(evt->ssid));
             memcpy(password, evt->password, sizeof(evt->password));
+			memcpy(cellphone_ip, evt->cellphone_ip, sizeof(evt->cellphone_ip));
             ESP_LOGI(TAG, "SmartConfig SSID: %s, Password: %s", ssid, password);
-            // 尝试连接WiFi会失败，故不连接
-            self->Save(ssid, password);
-            xTaskCreate([](void *ctx){
-                ESP_LOGI(TAG, "Restarting in 3 second");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                esp_restart();
-            }, "restart_task", 4096, NULL, 5, NULL);
-            break;
+			ESP_LOGI(TAG, "Phone ip: %d.%d.%d.%d", cellphone_ip[0], cellphone_ip[1], cellphone_ip[2], cellphone_ip[3]);
+            
+            WifiCredentials *creds = (WifiCredentials *)malloc(sizeof(WifiCredentials));
+            creds->ssid = (char *)malloc(strlen(ssid) + 1);
+            creds->password = (char *)malloc(strlen(password) + 1);
+            strcpy(creds->ssid, ssid);
+            strcpy(creds->password, password);          
+            creds->type = evt->type; 
+            creds->token = evt->token;
+
+			xTaskCreate([](void *ctx){
+                WifiCredentials *creds = (WifiCredentials *)ctx;
+                ESP_LOGI(TAG, "SSID: %s", creds->ssid);
+                ESP_LOGI(TAG, "Password: %s", creds->password);
+                ESP_LOGI(TAG, "Type: %d", creds->type);
+                ESP_LOGI(TAG, "Token: %d", creds->token);
+
+				WifiConfigurationAp& this_ = WifiConfigurationAp::GetInstance();
+
+				if (this_.ConnectToWifi(creds->ssid, creds->password)) {
+					this_.Save(creds->ssid, creds->password);
+				}
+				ESP_LOGI(TAG, "Restarting in 3 second");
+				vTaskDelay(pdMS_TO_TICKS(3000));
+				esp_restart();
+			}, "restart_task", 4096, creds, 5, NULL);
+			break;
         }
         case SC_EVENT_SEND_ACK_DONE:
             ESP_LOGI(TAG, "SmartConfig ACK sent");
