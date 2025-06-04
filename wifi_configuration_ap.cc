@@ -299,6 +299,9 @@ void WifiConfigurationAp::StartWebServer()
         .uri = "/scan",
         .method = HTTP_GET,
         .handler = [](httpd_req_t *req) -> esp_err_t {
+            // 停止SmartConfig服务
+            esp_smartconfig_stop();
+
             uint16_t ap_num = 0;
             esp_wifi_scan_get_ap_num(&ap_num);
 
@@ -647,7 +650,7 @@ void WifiConfigurationAp::StartWebServer()
     ESP_LOGI(TAG, "Web server started");
 }
 
-bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::string &password)
+bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::string &password, bool is_smartconfig)
 {
     if (ssid.empty()) {
         ESP_LOGE(TAG, "SSID cannot be empty");
@@ -662,46 +665,49 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
     is_connecting_ = true;
     esp_wifi_scan_stop();
     xEventGroupClearBits(event_group_, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    if (server_) {
-        httpd_stop(server_);
-        server_ = nullptr;
-    }
-    dns_server_.Stop();
-    if (instance_any_id_) {
-        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id_);
-        instance_any_id_ = nullptr;
-    }
-    if (instance_got_ip_) {
-        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip_);
-        instance_got_ip_ = nullptr;
-    }
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    esp_wifi_set_mode(WIFI_MODE_NULL);
-    if (ap_netif_) {
-        esp_netif_destroy(ap_netif_);
-        ap_netif_ = nullptr;
-    }
 
-    if (sta_netif_) {
-        esp_netif_destroy(sta_netif_);
-    }
-    sta_netif_ = esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &WifiConfigurationAp::WifiEventHandler,
-                                                        this,
-                                                        &instance_any_id_));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &WifiConfigurationAp::IpEventHandler,
-                                                        this,
-                                                        &instance_got_ip_));
+    if (is_smartconfig) {
+        if (server_) {
+            httpd_stop(server_);
+            server_ = nullptr;
+        }
+        dns_server_.Stop();
+        if (instance_any_id_) {
+            esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id_);
+            instance_any_id_ = nullptr;
+        }
+        if (instance_got_ip_) {
+            esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip_);
+            instance_got_ip_ = nullptr;
+        }
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        esp_wifi_set_mode(WIFI_MODE_NULL);
+        if (ap_netif_) {
+            esp_netif_destroy(ap_netif_);
+            ap_netif_ = nullptr;
+        }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
+        if (sta_netif_) {
+            esp_netif_destroy(sta_netif_);
+        }
+        sta_netif_ = esp_netif_create_default_wifi_sta();
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &WifiConfigurationAp::WifiEventHandler,
+                                                            this,
+                                                            &instance_any_id_));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                            IP_EVENT_STA_GOT_IP,
+                                                            &WifiConfigurationAp::IpEventHandler,
+                                                            this,
+                                                            &instance_got_ip_));
+
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
 
     wifi_config_t wifi_config;
     bzero(&wifi_config, sizeof(wifi_config));
@@ -836,8 +842,7 @@ void WifiConfigurationAp::SmartConfigEventHandler(void *arg, esp_event_base_t ev
                 ESP_LOGI(TAG, "Token: %d", creds->token);
 
 				WifiConfigurationAp& this_ = WifiConfigurationAp::GetInstance();
-
-				if (this_.ConnectToWifi(creds->ssid, creds->password)) {
+				if (this_.ConnectToWifi(creds->ssid, creds->password, true)) {
 					this_.Save(creds->ssid, creds->password);
                     vTaskDelay(pdMS_TO_TICKS(3000));
                     
@@ -857,7 +862,6 @@ void WifiConfigurationAp::SmartConfigEventHandler(void *arg, esp_event_base_t ev
         }
         case SC_EVENT_SEND_ACK_DONE:
             ESP_LOGI(TAG, "SmartConfig ACK sent");
-            esp_smartconfig_stop();
             break;
         }
     }

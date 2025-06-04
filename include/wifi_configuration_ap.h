@@ -55,7 +55,7 @@ private:
 
     void StartAccessPoint();
     void StartWebServer();
-    bool ConnectToWifi(const std::string &ssid, const std::string &password);
+    bool ConnectToWifi(const std::string &ssid, const std::string &password, bool is_smartconfig = false);
     void Save(const std::string &ssid, const std::string &password);
 
     // Event handlers
