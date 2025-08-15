@@ -40,6 +40,7 @@ WifiConfigurationAp::WifiConfigurationAp()
 {
     event_group_ = xEventGroupCreate();
     language_ = "zh-CN";
+    sleep_mode_ = false;
 }
 
 WifiConfigurationAp::~WifiConfigurationAp()
@@ -196,9 +197,18 @@ void WifiConfigurationAp::StartAccessPoint()
         uint8_t remember_bssid = 0;
         err = nvs_get_u8(nvs, "remember_bssid", &remember_bssid);
         if (err == ESP_OK) {
-            remember_bssid_ = remember_bssid;
+            remember_bssid_ = remember_bssid != 0;
         } else {
-            remember_bssid_ = true; // 默认值
+            remember_bssid_ = false; // 默认值
+        }
+
+        // 读取睡眠模式设置
+        uint8_t sleep_mode = 0;
+        err = nvs_get_u8(nvs, "sleep_mode", &sleep_mode);
+        if (err == ESP_OK) {
+            sleep_mode_ = sleep_mode != 0;
+        } else {
+            sleep_mode_ = true; // 默认值
         }
 
         nvs_close(nvs);
@@ -257,7 +267,8 @@ void WifiConfigurationAp::StartWebServer()
             std::string uri = req->uri;
             auto pos = uri.find("?index=");
             if (pos != std::string::npos) {
-                int index = std::stoi(uri.substr(pos + 7));
+                int index = -1;
+                sscanf(&req->uri[pos+7], "%d", &index);
                 ESP_LOGI(TAG, "Set default item %d", index);
                 SsidManager::GetInstance().SetDefaultSsid(index);
             }
@@ -279,7 +290,8 @@ void WifiConfigurationAp::StartWebServer()
             std::string uri = req->uri;
             auto pos = uri.find("?index=");
             if (pos != std::string::npos) {
-                int index = std::stoi(uri.substr(pos + 7));
+                int index = -1;
+                sscanf(&req->uri[pos+7], "%d", &index);
                 ESP_LOGI(TAG, "Delete saved list item %d", index);
                 SsidManager::GetInstance().RemoveSsid(index);
             }
@@ -383,7 +395,7 @@ void WifiConfigurationAp::StartWebServer()
             cJSON *ssid_item = cJSON_GetObjectItemCaseSensitive(json, "ssid");
             cJSON *password_item = cJSON_GetObjectItemCaseSensitive(json, "password");
 
-            if (!cJSON_IsString(ssid_item) || (ssid_item->valuestring == NULL)) {
+            if (!cJSON_IsString(ssid_item) || (ssid_item->valuestring == NULL) || (strlen(ssid_item->valuestring) >= 33)) {
                 cJSON_Delete(json);
                 httpd_resp_send(req, "{\"success\":false,\"error\":\"无效的 SSID\"}", HTTPD_RESP_USE_STRLEN);
                 return ESP_OK;
@@ -391,7 +403,7 @@ void WifiConfigurationAp::StartWebServer()
 
             std::string ssid_str = ssid_item->valuestring;
             std::string password_str = "";
-            if (cJSON_IsString(password_item) && (password_item->valuestring != NULL)) {
+            if (cJSON_IsString(password_item) && (password_item->valuestring != NULL) && (strlen(password_item->valuestring) < 65)) {
                 password_str = password_item->valuestring;
             }
 
@@ -521,6 +533,7 @@ void WifiConfigurationAp::StartWebServer()
             }
             cJSON_AddNumberToObject(json, "max_tx_power", this_->max_tx_power_);
             cJSON_AddBoolToObject(json, "remember_bssid", this_->remember_bssid_);
+            cJSON_AddBoolToObject(json, "sleep_mode", this_->sleep_mode_);
 
             // 发送JSON响应
             char *json_str = cJSON_PrintUnformatted(json);
@@ -620,9 +633,19 @@ void WifiConfigurationAp::StartWebServer()
             cJSON *remember_bssid = cJSON_GetObjectItem(json, "remember_bssid");
             if (cJSON_IsBool(remember_bssid)) {
                 this_->remember_bssid_ = cJSON_IsTrue(remember_bssid);
-                err = nvs_set_u8(nvs, "remember_bssid", this_->remember_bssid_);
+                err = nvs_set_u8(nvs, "remember_bssid", this_->remember_bssid_ ? 1 : 0);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Failed to save remember_bssid: %d", err);
+                }
+            }
+
+            // 保存睡眠模式设置
+            cJSON *sleep_mode = cJSON_GetObjectItem(json, "sleep_mode");
+            if (cJSON_IsBool(sleep_mode)) {
+                this_->sleep_mode_ = cJSON_IsTrue(sleep_mode);
+                err = nvs_set_u8(nvs, "sleep_mode", this_->sleep_mode_ ? 1 : 0);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to save sleep_mode: %d", err);
                 }
             }
 
@@ -640,6 +663,9 @@ void WifiConfigurationAp::StartWebServer()
             httpd_resp_set_type(req, "application/json");
             httpd_resp_set_hdr(req, "Connection", "close");
             httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+
+            ESP_LOGI(TAG, "Saved settings: ota_url=%s, max_tx_power=%d, remember_bssid=%d, sleep_mode=%d",
+                this_->ota_url_.c_str(), this_->max_tx_power_, this_->remember_bssid_, this_->sleep_mode_);
             return ESP_OK;
         },
         .user_ctx = this
@@ -658,6 +684,11 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
     
     if (ssid.length() > 32) {  // WiFi SSID 最大长度
         ESP_LOGE(TAG, "SSID too long");
+        return false;
+    }
+
+    if (password.length() > 64) {
+        ESP_LOGE(TAG, "Password too long");
         return false;
     }
     
@@ -710,8 +741,8 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
 
     wifi_config_t wifi_config;
     bzero(&wifi_config, sizeof(wifi_config));
-    strcpy((char *)wifi_config.sta.ssid, ssid.c_str());
-    strcpy((char *)wifi_config.sta.password, password.c_str());
+    strlcpy((char *)wifi_config.sta.ssid, ssid.c_str(), 32);
+    strlcpy((char *)wifi_config.sta.password, password.c_str(), 64);
     wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     wifi_config.sta.failure_retry_cnt = 1;
     
